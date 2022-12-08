@@ -22,7 +22,7 @@ from itertools import product
 def GPIL(*, Y, N_pseudo: int, M_dim: int):
     gp_f, gp_g, loc_0, cov_0 = GPIL_init(Y=Y, N_pseudo=N_pseudo, M_dim=M_dim)
     gp_f, gp_g, loc_0, cov_0 = GPIL_EM(
-        Y=Y, gp_f=gp_f, gp_g=gp_g, E_X=loc_0, cov_X=cov_0)
+        Y=Y, gp_f=gp_f, gp_g=gp_g, E_0=loc_0, cov_0=cov_0)
     return gp_f, gp_g
 
 
@@ -30,7 +30,7 @@ def GPIL_init(Y, N_pseudo: int, M_dim: int):
     Y_filt, lv_state, lv_cov = init_latent_state(Y=Y, M_dim=M_dim)
 
     loc_0 = torch.zeros((N_pseudo,))  # not sure what these are for yet..
-    cov_0 = torch.eye(N_pseudo)
+    cov_0 = torch.eye(N_pseudo) # I am expecting these test inputs should be filtered / aligned with the inducing points of gp_f
 
     gp_f = init_spg(X_0=lv_state[:-1], y_0=lv_state[1:],
                     N_pseudo=N_pseudo, M_dim=M_dim)
@@ -39,9 +39,9 @@ def GPIL_init(Y, N_pseudo: int, M_dim: int):
     return gp_f, gp_g, loc_0, cov_0
 
 
-def GPIL_EM(*, Y, gp_f, gp_g, E_X, cov_X, N_EM_steps=10):
+def GPIL_EM(*, Y, gp_f, gp_g, E_0, cov_0, N_EM_steps=10):
     for k in range(N_EM_steps):
-        moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_X=E_X, cov_X=cov_X)
+        moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_X=E_0, cov_X=cov_0)
         gp_f, gp_g = amax_likelihood(
             moments=moments, Y=Y, gp_f=gp_f, gp_g=gp_g)
 
@@ -65,7 +65,7 @@ def GP_ADF(*, Y, gp_f, gp_g, E_0, cov_0):
         a, b = gp_f.Xu
         E_x, cov_X, _ = GPUR(gp_list=gp_f, loc_in=E_X, cov_in=cov_X, X=a, y=b)
 
-    return E_y_list, cov_y_list, E_x, cov_X
+    return E_y_list, cov_y_list
 
 
 def init_latent_state(*, Y: torch.tensor, M_dim: int) -> tuple:
@@ -126,7 +126,7 @@ def init_spg(*, X_0: torch.tensor, y_0: torch.tensor, N_pseudo: int, M_dim: int)
     return gp_list, kernel_list
 
 
-def amax_likelihood(*, moments, Y, gp_f, gp_g, num_steps: int):
+def amax_likelihood(*, E_0,cov_0, Y, gp_f, gp_g, num_steps: int):
 
     params = [gp.parameters() for gp in gp_f+gp_g]
 
@@ -135,21 +135,17 @@ def amax_likelihood(*, moments, Y, gp_f, gp_g, num_steps: int):
 
     for k in range(num_steps):
         optimizer.zero_grad()
-        loss, moments = marginal_loglikelihood(
-            moments=moments, Y=Y, gp_f=gp_f, gp_g=gp_g)
+        loss= marginal_loglikelihood(
+            E_0=E_0,cov_0=cov_0, Y=Y, gp_f=gp_f, gp_g=gp_g)
         loss.backward()
         optimizer.step()
 
 
-def marginal_loglikelihood(*, moments, Y, gp_f, gp_g):
-    # this seems to be the right probability dist but it is not a function of the parameters
-    # UNLESS pytorch has tracked the gradient through GP_ADF
-    # still moments unchanged during gp_f, gp_g update
+def marginal_loglikelihood(*, E_0, cov_0, Y, gp_f, gp_g):
+    
 
-    _, _, E_X, cov_X = moments
-    moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_0=E_X, cov_0=cov_X)
-    return torch.sum(dist.MultivariateNormal(loc=E_y, covariance_matrix=cov_y).log_prob(Y_t) for Y_t, (E_y, cov_y) in zip(Y, moments)), moments
-
+    moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_0=E_0, cov_0=cov_0)
+    return torch.sum(dist.MultivariateNormal(loc=E_y, covariance_matrix=cov_y).log_prob(Y_t) for Y_t, (E_y, cov_y) in zip(Y, moments))
 
 def GPUR(*, X, y, loc_in, cov_in, gp_list):
     '''Gaussian Process Regression with Uncertain inputs'''
