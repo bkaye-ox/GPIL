@@ -65,7 +65,7 @@ def GP_ADF(*, Y, gp_f, gp_g, E_0, cov_0):
         a, b = gp_f.Xu
         E_x, cov_X, _ = GPUR(gp_list=gp_f, loc_in=E_X, cov_in=cov_X, X=a, y=b)
 
-    return E_y_list, cov_y_list
+    return E_y_list, cov_y_list, E_x, cov_X
 
 
 def init_latent_state(*, Y: torch.tensor, M_dim: int) -> tuple:
@@ -135,7 +135,7 @@ def amax_likelihood(*, moments, Y, gp_f, gp_g, num_steps: int):
 
     for k in range(num_steps):
         optimizer.zero_grad()
-        loss = marginal_loglikelihood(
+        loss, moments = marginal_loglikelihood(
             moments=moments, Y=Y, gp_f=gp_f, gp_g=gp_g)
         loss.backward()
         optimizer.step()
@@ -144,7 +144,11 @@ def amax_likelihood(*, moments, Y, gp_f, gp_g, num_steps: int):
 def marginal_loglikelihood(*, moments, Y, gp_f, gp_g):
     # this seems to be the right probability dist but it is not a function of the parameters
     # UNLESS pytorch has tracked the gradient through GP_ADF
-    return torch.sum(dist.MultivariateNormal(loc=E_y, covariance_matrix=cov_y).log_prob(Y_t) for Y_t, (E_y, cov_y) in zip(Y, moments))
+    # still moments unchanged during gp_f, gp_g update
+
+    _, _, E_X, cov_X = moments
+    moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_0=E_X, cov_0=cov_X)
+    return torch.sum(dist.MultivariateNormal(loc=E_y, covariance_matrix=cov_y).log_prob(Y_t) for Y_t, (E_y, cov_y) in zip(Y, moments)), moments
 
 
 def GPUR(*, X, y, loc_in, cov_in, gp_list):
@@ -162,7 +166,7 @@ def GPUR(*, X, y, loc_in, cov_in, gp_list):
     ker_var_list = []
 
     var_noise = torch.zeros((dim,))
-
+    V = torch.zeros((len(X), dim))
     for a, gp_a in enumerate(gp_list):
         with torch.nograd():
             Ka = gp_a.kernel(X)
@@ -182,7 +186,12 @@ def GPUR(*, X, y, loc_in, cov_in, gp_list):
         arg_v = X - loc_in
         q[a] = ker_var * \
             torch.det(cov_in @ inv_L + torch.eye()) * \
-            rbf_point(M=(cov_in+L), v=arg_v)  # TODO check scaling
+            rbf_point(M=(cov_in+L), v=arg_v)
+
+        sum_vec = torch.zeros((len(X),))
+        for i in range(len(X)):
+            sum_vec += beta_a[i]*q[a][i]*(X[i] - loc_in)
+        V[:][a] = cov_in @ torch.linalg.solve(cov_in + L, sum_vec)
 
     M = torch.zeros((len(gp_list), len(gp_list)))
     for a, b in mrange((len(gp_list),)*2):
@@ -206,9 +215,9 @@ def GPUR(*, X, y, loc_in, cov_in, gp_list):
     for e in range(dim):
         loc_star[e] = q[e]*torch.sum(beta_list[a])
     cov_star = M - torch.matmul(loc_star, loc_star.t()) + \
-        torch.diag(var_noise)  # Might not work
+        torch.diag(var_noise)
 
-    return loc_star, cov_star
+    return loc_star, cov_star, V
 
 
 def filter_update(*, y, E_X, cov_X, E_y, cov_y, cov_Xy):
