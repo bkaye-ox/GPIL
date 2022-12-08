@@ -200,12 +200,12 @@ def GPUR(*, X, y, loc_in, cov_in, gp_list):
                 torch.pow(torch.det((inv_L_list[a] + inv_L_list[b])@cov_in +
                                     torch.eye(cov_in.shape)), -0.5)*rbf_point(M=(L_list[a]+L_list[b]), v=(X[i]-X[j]))*rbf_point(M=(invArg+cov_in), v=(z_ij-loc_in))
         beta_a = beta_list[a]
-        M[a][b] = beta_a.T*Q_ab*beta_a
+        M[a][b] = beta_a.t()*Q_ab*beta_a
 
     loc_star = torch.zeros((dim,))
     for e in range(dim):
         loc_star[e] = q[e]*torch.sum(beta_list[a])
-    cov_star = M - torch.dot(loc_star, loc_star.T) + \
+    cov_star = M - torch.matmul(loc_star, loc_star.t()) + \
         torch.diag(var_noise)  # Might not work
 
     return loc_star, cov_star
@@ -217,7 +217,7 @@ def filter_update(*, y, E_X, cov_X, E_y, cov_y, cov_Xy):
 
     # could use more stable versions of these computations
     ret_E_X = E_X + cov_Xy @ torch.linalg(cov_y, innovation)
-    ret_cov_X = cov_X - cov_Xy @ torch.linalg(cov_y.T, cov_Xy.T)
+    ret_cov_X = cov_X - cov_Xy @ torch.linalg(cov_y.t(), cov_Xy.t())
     # return filtered Expected X, and Cov X
     return ret_E_X, ret_cov_X
 
@@ -229,4 +229,4 @@ def mrange(*sizes):
 
 def rbf_point(*, M, v):
     '''returns exp(-1/2vT*invM*v)'''
-    return torch.exp(-1/2*v.T@(torch.linalg.solve(M, v)))
+    return torch.exp(-1/2*v.t()@(torch.linalg.solve(M, v)))
