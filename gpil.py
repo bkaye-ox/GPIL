@@ -133,7 +133,6 @@ def amax_likelihood(*, moments, Y, gp_f, gp_g, num_steps: int):
     optimizer = torch.optim.Adam(
         params=params, lr=0.005)
 
-    raise NotImplemented
     for k in range(num_steps):
         optimizer.zero_grad()
         loss = marginal_loglikelihood(
@@ -144,7 +143,7 @@ def amax_likelihood(*, moments, Y, gp_f, gp_g, num_steps: int):
 
 def marginal_loglikelihood(*, moments, Y, gp_f, gp_g):
     # this seems to be the right probability dist but it is not a function of the parameters
-
+    # UNLESS pytorch has tracked the gradient through GP_ADF
     return torch.sum(dist.MultivariateNormal(loc=E_y, covariance_matrix=cov_y).log_prob(Y_t) for Y_t, (E_y, cov_y) in zip(Y, moments))
 
 
