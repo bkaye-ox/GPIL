@@ -1,3 +1,4 @@
+import shelve
 import torch
 from torch.nn import Parameter
 
@@ -13,6 +14,7 @@ from gpytorch.variational import VariationalStrategy
 
 import nfoursid.nfoursid
 import nfoursid.kalman
+import nfoursid.state_space
 
 import pandas as pd
 import numpy as np
@@ -20,30 +22,34 @@ from itertools import product
 
 
 def GPIL(*, Y, N_pseudo: int, M_dim: int):
-    gp_f, gp_g, loc_0, cov_0 = GPIL_init(Y=Y, N_pseudo=N_pseudo, M_dim=M_dim)
+    gp_f, gp_g, loc_0, cov_0, ss_cov = GPIL_init(
+        Y=Y, N_pseudo=N_pseudo, M_dim=M_dim)
     gp_f, gp_g, loc_0, cov_0 = GPIL_EM(
         Y=Y, gp_f=gp_f, gp_g=gp_g, E_0=loc_0, cov_0=cov_0)
-    return gp_f, gp_g
+    return gp_f, gp_g, ss_cov
 
 
 def GPIL_init(Y, N_pseudo: int, M_dim: int):
-    Y_filt, lv_state, lv_cov = init_latent_state(Y=Y, M_dim=M_dim)
+    Y_filt, lv_state, lv_cov, ss_cov = init_latent_state(Y=Y, M_dim=M_dim)
+
+    lv_state = lv_state.t()
 
     loc_0 = torch.zeros((N_pseudo,))  # not sure what these are for yet..
-    cov_0 = torch.eye(N_pseudo) # I am expecting these test inputs should be filtered / aligned with the inducing points of gp_f
+    # I am expecting these test inputs should be filtered / aligned with the inducing points of gp_f
+    cov_0 = torch.eye(N_pseudo)
 
-    gp_f = init_spg(X_0=lv_state[:-1], y_0=lv_state[1:],
+    gp_f = init_spg(X_0=lv_state[:-1, :], y_0=lv_state[1:, :].t(),
                     N_pseudo=N_pseudo, M_dim=M_dim)
-    gp_g = init_spg(X_0=lv_state, y=Y_filt, N_pseudo=N_pseudo, M_dim=M_dim)
+    gp_g = init_spg(X_0=lv_state, y_0=Y_filt, N_pseudo=N_pseudo, M_dim=M_dim)
 
-    return gp_f, gp_g, loc_0, cov_0
+    return gp_f, gp_g, loc_0, cov_0, ss_cov
 
 
 def GPIL_EM(*, Y, gp_f, gp_g, E_0, cov_0, N_EM_steps=10):
     for k in range(N_EM_steps):
-        moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_X=E_0, cov_X=cov_0)
+        # moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_X=E_0, cov_X=cov_0)
         gp_f, gp_g = amax_likelihood(
-            moments=moments, Y=Y, gp_f=gp_f, gp_g=gp_g)
+            E_0=E_0, cov_0=cov_0, Y=Y, gp_f=gp_f, gp_g=gp_g)
 
     return gp_f, gp_g
 
@@ -81,32 +87,48 @@ def init_latent_state(*, Y: torch.tensor, M_dim: int) -> tuple:
 
     n4sid.subspace_identification()
     ss, cov = n4sid.system_identification(rank=M_dim)
+
+    ss_cov = (ss, cov)
+
+    return *kalf(Y=Y, ss=ss, cov=cov), ss_cov
+
+
+def kalf(Y, ss, cov):
+    '''Kalman filter given a State Space model'''
+
     kalman = nfoursid.kalman.Kalman(ss, cov)
     for y in Y:
         kalman.step(np.asarray([[y]]), u=np.asarray([[]]).reshape((0, 1)))
 
-    lv_hat = torch.tensor(kalman.x_filtereds)
-    cov_lv_hat = torch.tensor(kalman.p_filtereds)
-    Y_filt = torch.tensor(kalman.y_filtereds)
-
+    lv_hat = t2d_from_n4sid(kalman.x_filtereds)
+    cov_lv_hat = t2d_from_n4sid(kalman.p_filtereds)
+    Y_filt = t2d_from_n4sid(kalman.y_filtereds)
     return Y_filt, lv_hat, cov_lv_hat
 
 
-def init_spg(*, X_0: torch.tensor, y_0: torch.tensor, N_pseudo: int, M_dim: int) -> tuple(list, list):
+def t2d_from_n4sid(res):
+    '''returns a 2D torch.Tensor from nfoursid interface'''
+    return torch.tensor(np.concatenate(res, axis=1))
 
-    num_outputs = len(y_0)
+
+def init_spg(*, X_0: torch.tensor, y_0: torch.tensor, N_pseudo: int, M_dim: int) -> tuple:
+
+    # num_outputs = len(y_0)
+
+    N_points, num_outputs = y_0.shape
 
     gp_list = []
     kernel_list = []
 
-    for k in range(num_outputs):
+    for k, y in enumerate(y_0):
 
         kernel = gp.kernels.RBF(
-            input_dim=M_dim, lengthscale=torch.ones(M_dim))
+            input_dim=M_dim)
 
         ### FIT INITIAL KERNEL ###
-        gp_0 = gp.models.GPRegression(X=X_0, y=y_0, kernel=kernel)
-        gp_0.util.train(gpmodule=gp_0, num_steps=300)
+        gp_0 = gp.models.GPRegression(
+            X=X_0, y=y, kernel=kernel, noise=torch.tensor(1e-6))
+        gp.util.train(gpmodule=gp_0, num_steps=300)
 
         ### SAMPLE INDUCING POINTS ###
         indices = [int(len(X_0)*rv)
@@ -114,8 +136,8 @@ def init_spg(*, X_0: torch.tensor, y_0: torch.tensor, N_pseudo: int, M_dim: int)
         Xu = X_0[indices]
 
         ### FIT SPARSE GP USING OPTIMAL KERNEL ###
-        sgp = gp_0.models.GPLVM(
-            gp_0.models.SparseGPRegression(X=X_0, y=y_0, Xu=Xu, kernel=kernel))
+        sgp = gp.models.GPLVM(
+            gp.models.SparseGPRegression(X=X_0, y=y_0, Xu=Xu, kernel=kernel, noise=torch.tensor(1e-6)))
 
         ### TUNE INDUCING POINTS AND KERNEL ###
         gp.util.train(gpmodule=sgp, num_steps=300)
@@ -126,7 +148,7 @@ def init_spg(*, X_0: torch.tensor, y_0: torch.tensor, N_pseudo: int, M_dim: int)
     return gp_list, kernel_list
 
 
-def amax_likelihood(*, E_0,cov_0, Y, gp_f, gp_g, num_steps: int):
+def amax_likelihood(*, E_0, cov_0, Y, gp_f, gp_g, num_steps: int):
 
     params = [gp.parameters() for gp in gp_f+gp_g]
 
@@ -135,17 +157,17 @@ def amax_likelihood(*, E_0,cov_0, Y, gp_f, gp_g, num_steps: int):
 
     for k in range(num_steps):
         optimizer.zero_grad()
-        loss= marginal_loglikelihood(
-            E_0=E_0,cov_0=cov_0, Y=Y, gp_f=gp_f, gp_g=gp_g)
+        loss = marginal_loglikelihood(
+            E_0=E_0, cov_0=cov_0, Y=Y, gp_f=gp_f, gp_g=gp_g)
         loss.backward()
         optimizer.step()
 
 
 def marginal_loglikelihood(*, E_0, cov_0, Y, gp_f, gp_g):
-    
 
     moments = GP_ADF(Y=Y, gp_f=gp_f, gp_g=gp_g, E_0=E_0, cov_0=cov_0)
     return torch.sum(dist.MultivariateNormal(loc=E_y, covariance_matrix=cov_y).log_prob(Y_t) for Y_t, (E_y, cov_y) in zip(Y, moments))
+
 
 def GPUR(*, X, y, loc_in, cov_in, gp_list):
     '''Gaussian Process Regression with Uncertain inputs'''
@@ -235,3 +257,108 @@ def mrange(*sizes):
 def rbf_point(*, M, v):
     '''returns exp(-1/2vT*invM*v)'''
     return torch.exp(-1/2*v.t()@(torch.linalg.solve(M, v)))
+
+
+class gpts():
+    '''
+    Usage: 
+    1. gpts.train() offline on a series
+    2. gpts.init_predict() on a series
+    3. gpts.predict_next() to retrieve the expected result
+    '''
+
+    def __init__(self, Y_train=None, **kwargs) -> None:
+        self.params = None
+        if Y_train is not None:
+            self.train(Y=Y_train, **kwargs)
+
+        self.y = None
+        self.y_cov = None
+        self.x_loc = None
+        self.x_cov = None
+
+    def train(self, *, Y, N_pseudo: int, M_dim: int):
+        gp_f, gp_g, ss_cov = GPIL(Y=Y, N_pseudo=N_pseudo, M_dim=M_dim)
+        self.params = gpts.get_params(gp_f=gp_f, gp_g=gp_g, kf_fit=ss_cov)
+
+    def init_predict(self, *, Y):
+        print('len(Y) should be sufficient to burn in HMM')
+        # broad steps:
+        # 1. initialise latent state using the kalman filter
+        # 2. run inference, using fixed parameters
+
+        Y_filt, X_est, X_cov = kalf(
+            Y=Y, ss=self.params.ss, cov=self.params.cov)
+
+        self.y = Y_filt
+        self.x_loc = X_est
+        self.x_cov = X_cov
+
+    def predict_N(self, N_steps, u_k=None):
+        if u_k is not None:
+            assert N_steps == len(u_k)
+        
+        
+
+    def get_params(*, gp_f, gp_g, ss_cov):
+        return gpts_params(gp_f=gp_f, gp_g=gp_g, ss_cov=ss_cov)
+
+
+class gpts_params():
+    def __init__(self, gp_f, gp_g, ss_cov) -> None:
+        # extract params from the sparse gaussian regressions
+        
+        # f_X = gp_f.Xu
+        # f_y = gp_f.
+
+        # self.params = {
+        #     'f': {
+        #         'X': f_X,
+        #         'y': f_y,
+        #         'cov': f_var,
+        #     },
+        #     'g': {
+
+        #     },
+        #     'ss': {
+        #         'lti': ss_cov[0]
+        #         'cov': ss_cov[1]
+        #     }
+        # }
+        pass
+
+
+def dump_scope(f='shelfout'):
+    fn = f'tmp/{f}'
+    with shelve.open(fn) as shelf:
+        for key in dir():
+            try:
+                shelf[key] = locals()[key]
+            except TypeError:
+                pass
+
+
+def load_scope(f='shelfout'):
+    fn = f'tmp/{f}'
+    with shelve.open(fn) as shelf:
+        for key in shelf:
+            locals()[key] = shelf[key]
+
+
+def test_env():
+    ss = nfoursid.state_space(
+        a=np.array([[0, 1], [-1, -0.5]]),
+        b=np.array([[0], [1]]),
+        c=np.array([[1, 0]]),
+        d=np.array([[0]]),
+    )
+
+
+if __name__ == '__main__':
+
+    # df = pd.read_feather('dp_df.feather')
+    # Y = torch.tensor(df['o2pp'][:1000])
+    # ts = gpts(Y_train=Y, N_pseudo=50, M_dim=4)
+    # ts.predict(Y)
+
+    init_spg(X_0=None, y_0=None, N_pseudo=None, M_dim=None)
